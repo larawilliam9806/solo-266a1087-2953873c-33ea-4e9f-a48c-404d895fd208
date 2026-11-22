@@ -13,6 +13,7 @@
   <p>
     <a class="button" href="{{ url_for('main.upload') }}">上传 CSV 申报</a>
     <a class="button secondary" href="{{ url_for('main.specimens') }}">按试件查询现值</a>
+    <a class="button secondary" href="{{ url_for('main.strength_line') }}">强度线试算</a>
   </p>
   {% if stats.templates == 0 or stats.indicators == 0 %}
     <p class="hint">还没有登记模板或指标？先在

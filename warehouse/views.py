@@ -671,6 +671,69 @@ def specimen_detail(specimen_id: int):
 
 
 # ---------------------------------------------------------------------------
+# strength-line trial
+# ---------------------------------------------------------------------------
+
+
+def _parse_line_bound(raw: str, label: str, errors: list[str]) -> int | None:
+    text = (raw or "").strip()
+    if not text:
+        errors.append(f"请填写{label}")
+        return None
+    if core.value_has_extra_precision(text):
+        errors.append(f"{label}「{text}」最多三位小数（线值按 0.001 MPa 递增）")
+        return None
+    try:
+        return core.parse_value(text)
+    except core.ValueError_ as exc:
+        errors.append(f"{label}：{exc}")
+        return None
+
+
+@bp.get("/strength-line")
+def strength_line():
+    conn = get_db()
+    # One query, one committed snapshot; the trial itself writes nothing.
+    overview = core.summarize_strength_pairs(core.load_strength_summary(conn))
+
+    form = {
+        "lower": request.args.get("lower", "").strip(),
+        "upper": request.args.get("upper", "").strip(),
+        "max_changes": request.args.get("max_changes", "").strip(),
+    }
+    errors: list[str] = []
+    intervals: list[dict[str, int]] | None = None
+    if any(form.values()):
+        lower_micro = _parse_line_bound(form["lower"], "线值下限", errors)
+        upper_micro = _parse_line_bound(form["upper"], "线值上限", errors)
+        cap: int | None = None
+        if not form["max_changes"]:
+            errors.append("请填写可接受的改判数上限")
+        elif not form["max_changes"].isdigit():
+            errors.append("改判数上限应为不小于 0 的整数")
+        else:
+            cap = int(form["max_changes"])
+        if (
+            lower_micro is not None
+            and upper_micro is not None
+            and lower_micro > upper_micro
+        ):
+            errors.append("线值下限不能大于上限")
+        if not errors:
+            intervals = core.acceptable_intervals(
+                overview.spans, lower_micro, upper_micro, cap
+            )
+    return render_template(
+        "strength_line.html",
+        overview=overview,
+        indicator_ids=core.strength_indicator_ids(conn),
+        form=form,
+        errors=errors,
+        intervals=intervals,
+    )
+
+
+# ---------------------------------------------------------------------------
 # errors
 # ---------------------------------------------------------------------------
 

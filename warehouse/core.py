@@ -33,6 +33,12 @@ import sqlite3
 MAX_VALUE_MICRO = 1_000_000_000  # 1000.000 MPa
 MAX_SPECIMEN_LENGTH = 128
 
+#: Indicator codes paired by the strength-line trial.  The summary table and
+#: the trial page both key off these codes, so a deployment that renames
+#: indicators must keep the codes.
+MEASURED_INDICATOR_CODE = "STRENGTH_MEASURED"
+CONVERTED_INDICATOR_CODE = "STRENGTH_CONVERTED"
+
 
 class ParseError(Exception):
     """The CSV cannot be interpreted with the selected template."""
@@ -519,9 +525,21 @@ def recompute_base(
     Highest revision wins.  A tie on the revision number is resolved by the
     latest upload (values are guaranteed to agree by conflict detection).
     Pairs with no remaining declaration are removed from the base table.
+
+    Specimens whose measured/converted strength changed have their
+    strength-line summary row refreshed in the same transaction, so the
+    base table and the summary always take effect (or roll back) together.
     """
+    strength_ids = strength_indicator_ids(conn)
+    strength_indicator_set = {
+        indicator_id for indicator_id in strength_ids.values()
+        if indicator_id is not None
+    }
+    strength_specimens: set[int] = set()
     changes: list[dict[str, Any]] = []
     for specimen_id, indicator_id in sorted(set(pairs)):
+        if indicator_id in strength_indicator_set:
+            strength_specimens.add(specimen_id)
         old = conn.execute(
             "SELECT * FROM base_values WHERE specimen_id = ? AND indicator_id = ?",
             (specimen_id, indicator_id),
@@ -600,7 +618,117 @@ def recompute_base(
                     "revision": winner["revision_raw"],
                 }
             )
+    if strength_specimens:
+        refresh_strength_summary(conn, strength_specimens)
     return changes
+
+
+# ---------------------------------------------------------------------------
+# strength-line trial summary
+# ---------------------------------------------------------------------------
+
+
+def strength_indicator_ids(conn: sqlite3.Connection) -> dict[str, int | None]:
+    """Ids of the measured / converted compressive-strength indicators."""
+    ids: dict[str, int | None] = {"measured": None, "converted": None}
+    for row in conn.execute(
+        "SELECT id, code FROM indicators WHERE code IN (?, ?)",
+        (MEASURED_INDICATOR_CODE, CONVERTED_INDICATOR_CODE),
+    ):
+        key = "measured" if row["code"] == MEASURED_INDICATOR_CODE else "converted"
+        ids[key] = row["id"]
+    return ids
+
+
+def refresh_strength_summary(
+    conn: sqlite3.Connection, specimen_ids: Iterable[int]
+) -> None:
+    """Bring the summary rows of the given specimens in line with the base table.
+
+    Only the specimens touched by an upload / template switch are rewritten.
+    Runs inside the caller's transaction: a rejected operation leaves both
+    the base table and the summary untouched.
+    """
+    ids = strength_indicator_ids(conn)
+    measured_id = ids["measured"]
+    converted_id = ids["converted"]
+    if measured_id is None and converted_id is None:
+        return
+    for specimen_id in sorted(set(specimen_ids)):
+        measured = converted = None
+        for row in conn.execute(
+            """
+            SELECT indicator_id, value_micro, revision
+            FROM base_values
+            WHERE specimen_id = ? AND indicator_id IN (?, ?)
+            """,
+            (specimen_id, measured_id, converted_id),
+        ):
+            if row["indicator_id"] == measured_id:
+                measured = row
+            else:
+                converted = row
+        if measured is None and converted is None:
+            conn.execute(
+                "DELETE FROM strength_pair_summary WHERE specimen_id = ?",
+                (specimen_id,),
+            )
+            continue
+        conn.execute(
+            """
+            INSERT INTO strength_pair_summary
+                (specimen_id, measured_micro, measured_revision,
+                 converted_micro, converted_revision, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (specimen_id) DO UPDATE SET
+                measured_micro = excluded.measured_micro,
+                measured_revision = excluded.measured_revision,
+                converted_micro = excluded.converted_micro,
+                converted_revision = excluded.converted_revision,
+                updated_at = excluded.updated_at
+            """,
+            (
+                specimen_id,
+                measured["value_micro"] if measured else None,
+                measured["revision"] if measured else None,
+                converted["value_micro"] if converted else None,
+                converted["revision"] if converted else None,
+                now_iso(),
+            ),
+        )
+
+
+def rebuild_strength_summary(conn: sqlite3.Connection) -> int:
+    """Recompute the whole summary from the base table.
+
+    Called by ``init_db`` when the summary table is empty, which is how a
+    legacy database is folded in the first time the feature is enabled.
+    """
+    ids = strength_indicator_ids(conn)
+    measured_id = ids["measured"]
+    converted_id = ids["converted"]
+    conn.execute("DELETE FROM strength_pair_summary")
+    if measured_id is None and converted_id is None:
+        return 0
+    cursor = conn.execute(
+        """
+        INSERT OR REPLACE INTO strength_pair_summary
+            (specimen_id, measured_micro, measured_revision,
+             converted_micro, converted_revision, updated_at)
+        SELECT
+            bv.specimen_id,
+            MAX(CASE WHEN bv.indicator_id = :measured THEN bv.value_micro END),
+            MAX(CASE WHEN bv.indicator_id = :measured THEN bv.revision END),
+            MAX(CASE WHEN bv.indicator_id = :converted THEN bv.value_micro END),
+            MAX(CASE WHEN bv.indicator_id = :converted THEN bv.revision END),
+            :ts
+        FROM base_values bv
+        WHERE bv.indicator_id IN (:measured, :converted)
+        GROUP BY bv.specimen_id
+        """,
+        {"measured": measured_id, "converted": converted_id, "ts": now_iso()},
+    )
+    return cursor.rowcount
 
 
 # ---------------------------------------------------------------------------
@@ -814,3 +942,122 @@ def list_batches(conn: sqlite3.Connection) -> list[sqlite3.Row]:
         ORDER BY b.uploaded_at DESC, b.id DESC
         """
     ).fetchall()
+
+
+# ---------------------------------------------------------------------------
+# strength-line trial (read model)
+# ---------------------------------------------------------------------------
+
+
+def load_strength_summary(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The whole strength-pair summary in a single query.
+
+    One statement reads one committed snapshot: a trial never mixes rows
+    written before and after a concurrent upload, and never walks the base
+    table specimen by specimen.
+    """
+    return conn.execute(
+        """
+        SELECT ps.specimen_id, s.number,
+               ps.measured_micro, ps.measured_revision,
+               ps.converted_micro, ps.converted_revision
+        FROM strength_pair_summary ps
+        JOIN specimens s ON s.id = ps.specimen_id
+        ORDER BY s.number
+        """
+    ).fetchall()
+
+
+@dataclass
+class StrengthPairOverview:
+    """Summary rows split into comparable specimens and listed-aside ones."""
+
+    comparable: list[dict[str, Any]] = field(default_factory=list)
+    excluded: list[dict[str, Any]] = field(default_factory=list)
+    # (first_line_micro, last_line_micro) ranges in which the specimen is
+    # re-judged: exactly one of its two strengths is at or above the line.
+    spans: list[tuple[int, int]] = field(default_factory=list)
+
+
+def summarize_strength_pairs(rows: Iterable[sqlite3.Row]) -> StrengthPairOverview:
+    """Split summary rows by the trial's comparability rule.
+
+    A specimen is comparable only when the base table holds both the
+    measured and the converted strength under the *same* revision number.
+    Specimens missing one of them, or sitting on different revisions, are
+    listed aside with the reason.
+    """
+    overview = StrengthPairOverview()
+    for row in rows:
+        measured_micro = row["measured_micro"]
+        converted_micro = row["converted_micro"]
+        entry: dict[str, Any] = {
+            "specimen_id": row["specimen_id"],
+            "number": row["number"],
+            "measured_micro": measured_micro,
+            "measured_revision": row["measured_revision"],
+            "converted_micro": converted_micro,
+            "converted_revision": row["converted_revision"],
+        }
+        if measured_micro is None or converted_micro is None:
+            entry["reason"] = "缺实测值" if measured_micro is None else "缺折算值"
+            overview.excluded.append(entry)
+            continue
+        if row["measured_revision"] != row["converted_revision"]:
+            entry["reason"] = "修订号不同"
+            overview.excluded.append(entry)
+            continue
+        overview.comparable.append(entry)
+        low, high = sorted((measured_micro, converted_micro))
+        if low < high:
+            # Line L re-judges this specimen iff low < L <= high.
+            overview.spans.append((low + 1, high))
+    return overview
+
+
+def acceptable_intervals(
+    spans: Iterable[tuple[int, int]],
+    lower_micro: int,
+    upper_micro: int,
+    max_changes: int,
+) -> list[dict[str, int]]:
+    """All maximal runs of line values whose re-judgment count stays within the cap.
+
+    Line values step by 0.001 MPa (one micro unit) from ``lower_micro`` to
+    ``upper_micro``, both inclusive.  Instead of probing each step, a sweep
+    over the specimens' change points walks the constant-count segments, so
+    the cost depends on the number of comparable specimens, not the width
+    of the range.
+    """
+    events: dict[int, int] = {}
+    for first, last in spans:
+        events[first] = events.get(first, 0) + 1
+        events[last + 1] = events.get(last + 1, 0) - 1
+
+    count = sum(delta for pos, delta in events.items() if pos <= lower_micro)
+    segments: list[tuple[int, int, int]] = []
+    seg_start = lower_micro
+    for pos in sorted(p for p in events if lower_micro < p <= upper_micro):
+        segments.append((seg_start, pos - 1, count))
+        count += events[pos]
+        seg_start = pos
+    segments.append((seg_start, upper_micro, count))
+
+    intervals: list[dict[str, int]] = []
+    for seg_lo, seg_hi, seg_count in segments:
+        if seg_count > max_changes:
+            continue
+        if intervals and intervals[-1]["upper_micro"] == seg_lo - 1:
+            intervals[-1]["upper_micro"] = seg_hi
+            intervals[-1]["max_changes"] = max(
+                intervals[-1]["max_changes"], seg_count
+            )
+        else:
+            intervals.append(
+                {
+                    "lower_micro": seg_lo,
+                    "upper_micro": seg_hi,
+                    "max_changes": seg_count,
+                }
+            )
+    return intervals

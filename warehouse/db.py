@@ -7,6 +7,8 @@ from pathlib import Path
 
 from flask import current_app, g
 
+from . import core
+
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
@@ -34,8 +36,15 @@ def init_db(conn: sqlite3.Connection | None = None) -> None:
     if own:
         conn = get_db()
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-    if own:
-        conn.commit()
+    # First enablement on a legacy database: the summary table has just been
+    # created, so fold the existing base values into it.  On a fresh database
+    # (or once the summary is maintained transactionally) this is a no-op.
+    if (
+        conn.execute("SELECT 1 FROM strength_pair_summary LIMIT 1").fetchone()
+        is None
+    ):
+        core.rebuild_strength_summary(conn)
+    conn.commit()
 
 
 def init_app(app) -> None:
@@ -44,6 +53,7 @@ def init_app(app) -> None:
     if app.config.get("AUTO_INIT_DB", True):
         Path(database).parent.mkdir(parents=True, exist_ok=True)
         raw = sqlite3.connect(database, timeout=30)
+        raw.row_factory = sqlite3.Row
         try:
             raw.execute("PRAGMA journal_mode = WAL")
             init_db(raw)

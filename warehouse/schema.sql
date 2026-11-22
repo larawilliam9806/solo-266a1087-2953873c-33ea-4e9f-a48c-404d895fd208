@@ -73,6 +73,17 @@ CREATE TABLE IF NOT EXISTS base_values (
     PRIMARY KEY (specimen_id, indicator_id)
 );
 
+-- 强度线试算汇总：每个在底表中持有实测或折算抗压强度的试件一行，
+-- 与 base_values 在同一事务中增量维护；首次在旧库上启用时由 init_db 回填。
+CREATE TABLE IF NOT EXISTS strength_pair_summary (
+    specimen_id        INTEGER PRIMARY KEY REFERENCES specimens(id),
+    measured_micro     INTEGER,
+    measured_revision  INTEGER,
+    converted_micro    INTEGER,
+    converted_revision INTEGER,
+    updated_at         TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS batch_template_changes (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
     batch_id         INTEGER NOT NULL REFERENCES batches(id) ON DELETE CASCADE,

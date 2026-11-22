@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}强度线试算 · 混凝土试件申报入仓{% endblock %}
+{% block content %}
+<h1>强度线试算</h1>
+<p class="hint">比较底表中同一试件、同一修订号下的实测与折算抗压强度：恰好一项不低于强度线时，
+  该试件计为一次改判。试算只读取已提交的汇总快照，逐档在内存中完成，不改动任何数据。</p>
+
+{% if not indicator_ids.measured or not indicator_ids.converted %}
+  <p class="warn">指标字典中尚未同时登记 <code>STRENGTH_MEASURED</code>（实测）与
+    <code>STRENGTH_CONVERTED</code>（折算），无法汇总比对。请先在
+    <a href="{{ url_for('main.indicators') }}">指标字典</a> 登记，或运行
+    <code>flask --app app seed-metadata</code>。</p>
+{% endif %}
+
+{% if errors %}
+  <ul class="errors">
+    {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+  </ul>
+{% endif %}
+
+<form method="get" action="{{ url_for('main.strength_line') }}" class="panel stack">
+  <label>线值下限（MPa）
+    <input name="lower" value="{{ form.lower }}" placeholder="如 30" inputmode="decimal">
+  </label>
+  <label>线值上限（MPa）
+    <input name="upper" value="{{ form.upper }}" placeholder="如 40" inputmode="decimal">
+  </label>
+  <label>可接受的改判数上限
+    <input name="max_changes" value="{{ form.max_changes }}" placeholder="如 0" inputmode="numeric">
+  </label>
+  <p class="hint">线值按 0.001 MPa 递增，上下限均可取到，最多三位小数。</p>
+  <button type="submit">试算</button>
+</form>
+
+<section class="panel">
+  <h2>可比试件</h2>
+  <p>可比试件数：<strong>{{ overview.comparable | length }}</strong>
+    <span class="muted">（底表中实测、折算均存在且修订号相同的试件）</span></p>
+</section>
+
+{% if intervals is not none %}
+<section class="panel">
+  <h2>试算结果</h2>
+  {% if intervals %}
+    <p class="hint">以下线值区间内，改判数均不超过 {{ form.max_changes }}。区间端点均可取到。</p>
+    <table>
+      <thead><tr><th>线值区间（MPa）</th><th>档数（0.001 MPa）</th><th>区间内最大改判数</th></tr></thead>
+      <tbody>
+      {% for iv in intervals %}
+        <tr>
+          <td class="value">{{ iv.lower_micro | micro }} – {{ iv.upper_micro | micro }}</td>
+          <td>{{ iv.upper_micro - iv.lower_micro + 1 }}</td>
+          <td>{{ iv.max_changes }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  {% else %}
+    <p class="muted">在该范围内，没有任何线值的改判数不超过 {{ form.max_changes }}。</p>
+  {% endif %}
+</section>
+{% endif %}
+
+<section class="panel">
+  <h2>另列试件（缺一项或修订号不同，不参与比较）</h2>
+  {% if overview.excluded %}
+    <table>
+      <thead><tr><th>试件号</th><th>实测（修订号）</th><th>折算（修订号）</th><th>另列原因</th></tr></thead>
+      <tbody>
+      {% for e in overview.excluded[:200] %}
+        <tr>
+          <td><a href="{{ url_for('main.specimen_detail', specimen_id=e.specimen_id) }}">{{ e.number }}</a></td>
+          <td class="value">
+            {% if e.measured_micro is not none %}
+              {{ e.measured_micro | micro }}（修订 {{ e.measured_revision }}）
+            {% else %}—{% endif %}
+          </td>
+          <td class="value">
+            {% if e.converted_micro is not none %}
+              {{ e.converted_micro | micro }}（修订 {{ e.converted_revision }}）
+            {% else %}—{% endif %}
+          </td>
+          <td>{{ e.reason }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% if overview.excluded | length > 200 %}
+      <p class="muted">共 {{ overview.excluded | length }} 个另列试件，仅显示前 200 个。</p>
+    {% endif %}
+  {% else %}
+    <p class="muted">没有另列试件。</p>
+  {% endif %}
+</section>
+{% endblock %}
